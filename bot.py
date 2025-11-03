@@ -2,6 +2,7 @@ import os
 import json
 import hashlib
 import re
+import zipfile
 from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -95,8 +96,79 @@ def generate_tts_chirp(text):
         return all_audio
     
     except Exception as e:
-        print(f"TTS Error: {str(e)}")
+        print(f"Chirp3 TTS Error: {str(e)}")
+        # Try fallback to Wavenet
+        return generate_tts_wavenet(text)
+
+def generate_tts_wavenet(text):
+    """Fallback TTS using Wavenet"""
+    try:
+        client = get_google_tts_client()
+        
+        synthesis_input = texttospeech.SynthesisInput(text=text)
+        voice = texttospeech.VoiceSelectionParams(
+            language_code="cmn-CN",
+            name="cmn-CN-Wavenet-A",
+            ssml_gender=texttospeech.SsmlVoiceGender.FEMALE
+        )
+        
+        audio_config = texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.MP3,
+            speaking_rate=0.8,
+        )
+        
+        response = client.synthesize_speech(
+            input=synthesis_input,
+            voice=voice,
+            audio_config=audio_config
+        )
+        
+        return response.audio_content
+    
+    except Exception as e:
+        print(f"Wavenet TTS Error: {str(e)}")
         return None
+
+def generate_vocabulary_tts(chinese_text):
+    """Generate TTS for vocabulary items"""
+    return generate_tts_wavenet(chinese_text)
+
+def safe_filename(filename):
+    """Sanitize filename to prevent path traversal (ZIP slip vulnerability)"""
+    # Remove path separators and dangerous characters
+    filename = re.sub(r'[^\w\s.-]', '', filename)
+    filename = filename.replace('..', '').replace('/', '').replace('\\', '')
+    # Get just the basename to strip any path components
+    filename = os.path.basename(filename)
+    return filename.strip('_')
+
+def validate_deepseek_response(content):
+    """Validate DeepSeek JSON response structure"""
+    required_keys = ["main_text", "vocabulary", "opinion_texts", "discussion_questions"]
+    
+    # Check all required keys exist
+    if not all(k in content for k in required_keys):
+        missing = [k for k in required_keys if k not in content]
+        raise ValueError(f"Missing required keys in DeepSeek response: {missing}")
+    
+    # Validate vocabulary is a list
+    if not isinstance(content['vocabulary'], list):
+        raise ValueError("vocabulary must be a list")
+    
+    # Validate each vocabulary item has required fields
+    for item in content['vocabulary']:
+        if not all(k in item for k in ['english', 'chinese', 'pinyin']):
+            raise ValueError("Each vocabulary item must have 'english', 'chinese', 'pinyin'")
+    
+    # Validate opinion_texts has all three views
+    if not all(k in content['opinion_texts'] for k in ['positive', 'negative', 'balanced']):
+        raise ValueError("opinion_texts must have 'positive', 'negative', 'balanced'")
+    
+    # Validate discussion_questions is a list
+    if not isinstance(content['discussion_questions'], list):
+        raise ValueError("discussion_questions must be a list")
+    
+    return True
 
 def generate_content_with_deepseek(topic):
     """Generate all content using DeepSeek API"""
@@ -139,29 +211,88 @@ Important requirements:
             temperature=0.7
         )
         
-        content = response.choices[0].message.content
+        content_text = response.choices[0].message.content
         
         # Try to extract JSON if there's extra text
-        json_match = re.search(r'\{.*\}', content, re.DOTALL)
+        json_match = re.search(r'\{.*\}', content_text, re.DOTALL)
         if json_match:
-            content = json_match.group()
+            content_text = json_match.group()
         
-        return json.loads(content)
+        # Parse JSON
+        content = json.loads(content_text)
+        
+        # Validate structure
+        validate_deepseek_response(content)
+        
+        return content
     
+    except json.JSONDecodeError as e:
+        print(f"JSON parsing error: {str(e)}")
+        return None
+    except ValueError as e:
+        print(f"Validation error: {str(e)}")
+        return None
     except Exception as e:
         print(f"DeepSeek API Error: {str(e)}")
         return None
 
-def create_vocabulary_file(vocabulary, topic):
-    """Create tab-delimited vocabulary file"""
+def create_vocabulary_file_with_tts(vocabulary, topic):
+    """Create tab-delimited vocabulary file with TTS audio tags and return audio files"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{topic}_{timestamp}_vocabulary.txt"
+    safe_topic_name = safe_filename(topic)
+    filename = f"{safe_topic_name}_{timestamp}_vocabulary.txt"
     
     content = ""
-    for item in vocabulary:
-        content += f"{item['english']}\t{item['chinese']}\t{item['pinyin']}\n"
+    audio_files = {}  # Dictionary to store audio data: {filename: audio_bytes}
     
-    return filename, content
+    for item in vocabulary:
+        chinese_text = item['chinese']
+        
+        # Generate TTS audio
+        audio_data = generate_vocabulary_tts(chinese_text)
+        
+        if audio_data:
+            # Create filename using MD5 hash (same as original code)
+            hash_object = hashlib.md5(chinese_text.encode())
+            audio_filename = f"tts_{hash_object.hexdigest()}.mp3"
+            
+            # Sanitize filename
+            audio_filename = safe_filename(audio_filename)
+            
+            # Store audio data
+            audio_files[audio_filename] = audio_data
+            
+            # Create Anki sound tag
+            anki_tag = f"[sound:{audio_filename}]"
+            
+            # Add row with 4 columns: english, chinese, pinyin, audio_tag
+            content += f"{item['english']}\t{item['chinese']}\t{item['pinyin']}\t{anki_tag}\n"
+        else:
+            # If TTS fails, just add 3 columns without audio
+            content += f"{item['english']}\t{item['chinese']}\t{item['pinyin']}\n"
+    
+    return filename, content, audio_files
+
+def create_zip_package(vocab_filename, vocab_content, audio_files, topic, timestamp):
+    """Create a ZIP file containing vocabulary txt and all MP3 files"""
+    safe_topic_name = safe_filename(topic)
+    zip_filename = f"{safe_topic_name}_{timestamp}_anki_package.zip"
+    zip_buffer = BytesIO()
+    
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        # Sanitize vocabulary filename
+        safe_vocab_filename = safe_filename(vocab_filename)
+        
+        # Add vocabulary text file
+        zip_file.writestr(safe_vocab_filename, vocab_content.encode('utf-8'))
+        
+        # Add all audio files with sanitized names
+        for audio_filename, audio_data in audio_files.items():
+            safe_audio_filename = safe_filename(audio_filename)
+            zip_file.writestr(safe_audio_filename, audio_data)
+    
+    zip_buffer.seek(0)
+    return zip_filename, zip_buffer
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send a message when the command /start is issued."""
@@ -170,9 +301,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Simply send me a topic (e.g., '大城市生活的压力', 'environmental protection', etc.) "
         "and I'll create:\n"
         "📄 A reading text\n"
-        "📝 Vocabulary list\n"
+        "📝 Vocabulary list with TTS audio\n"
         "🎤 3 opinion texts with audio\n"
-        "💬 Discussion questions\n\n"
+        "💬 Discussion questions\n"
+        "📦 ZIP package for Anki import\n\n"
         "Just type your topic to begin!"
     )
 
@@ -180,13 +312,19 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send a message when the command /help is issued."""
     await update.message.reply_text(
         "How to use:\n"
-        "1. Send me any topic in English or Chinese\n"
+        "1. Send me any topic in English or Chinese (max 100 characters)\n"
         "2. Wait while I generate materials (takes about 30-60 seconds)\n"
         "3. You'll receive:\n"
-        "   - Vocabulary file (.txt)\n"
+        "   - Vocabulary file with TTS tags (.txt)\n"
         "   - 3 audio files with different perspectives\n"
         "   - 3 opinion texts\n"
-        "   - Discussion questions\n\n"
+        "   - Discussion questions\n"
+        "   - ZIP package with vocabulary + MP3s for Anki\n\n"
+        "📦 For Anki import:\n"
+        "   - Download the ZIP file\n"
+        "   - Extract MP3 files to your Anki collection.media folder\n"
+        "   - Import the .txt file into Anki\n"
+        "   - See Anki documentation for your platform's media folder location\n\n"
         "Example topics:\n"
         "- 社交媒体的影响\n"
         "- work-life balance\n"
@@ -198,21 +336,46 @@ async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle topic message and generate all materials"""
     topic = update.message.text.strip()
     
+    # Input validation
+    if len(topic) > 100:
+        await update.message.reply_text("❌ Topic too long! Please keep it under 100 characters.")
+        return
+    
+    if not topic:
+        await update.message.reply_text("❌ Please send a topic to generate materials.")
+        return
+    
+    # Send typing action
+    await update.message.chat.send_action(action="typing")
+    
     await update.message.reply_text(f"📚 正在创建关于 '{topic}' 的学习材料...\n"
                                    f"Creating materials about '{topic}'...\n"
                                    f"This will take about 30-60 seconds...")
     
-    # Generate content with DeepSeek
-    content = generate_content_with_deepseek(topic)
+    # Send periodic typing updates
+    async def send_typing_updates():
+        for _ in range(12):  # 60 seconds / 5 seconds each
+            await asyncio.sleep(5)
+            try:
+                await update.message.chat.send_action(action="typing")
+            except:
+                break
     
-    if not content:
-        await update.message.reply_text("❌ Sorry, there was an error generating content. Please try again.")
-        return
-    
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_topic = re.sub(r'[^\w\s-]', '', topic).replace(' ', '_')[:30]
+    typing_task = asyncio.create_task(send_typing_updates())
     
     try:
+        # Generate content with DeepSeek
+        await update.message.reply_text("⏳ Step 1/4: Generating content with AI...")
+        content = generate_content_with_deepseek(topic)
+        
+        if not content:
+            await update.message.reply_text("❌ Sorry, there was an error generating content. Please try again with a different topic.")
+            typing_task.cancel()
+            return
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_topic = safe_filename(topic)
+        
         # Send main text
         await update.message.reply_text(f"📖 **Main Text:**\n\n{content['main_text']}", parse_mode='Markdown')
         
@@ -229,13 +392,40 @@ async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"This sometimes happens with AI generation."
             )
         
-        # Create and send vocabulary file
-        vocab_filename, vocab_content = create_vocabulary_file(content['vocabulary'], safe_topic)
-        vocab_file = BytesIO(vocab_content.encode('utf-8'))
-        vocab_file.name = vocab_filename
-        await update.message.reply_document(document=vocab_file, filename=vocab_filename)
+        # Create vocabulary file with TTS
+        await update.message.reply_text("⏳ Step 2/4: Generating TTS audio for vocabulary items...")
+        vocab_filename, vocab_content, audio_files = create_vocabulary_file_with_tts(
+            content['vocabulary'], 
+            safe_topic
+        )
+        
+        if not audio_files:
+            await update.message.reply_text("⚠️ Warning: Could not generate TTS audio for vocabulary. Continuing without audio...")
+        
+        # Create ZIP package
+        await update.message.reply_text("⏳ Step 3/4: Creating Anki import package...")
+        zip_filename, zip_buffer = create_zip_package(
+            vocab_filename, 
+            vocab_content, 
+            audio_files, 
+            safe_topic, 
+            timestamp
+        )
+        
+        # Send ZIP file
+        zip_buffer.name = zip_filename
+        await update.message.reply_document(
+            document=zip_buffer, 
+            filename=zip_filename,
+            caption="📦 Anki Import Package\n\n"
+                   "Contains:\n"
+                   f"• {vocab_filename} (vocabulary with TTS tags)\n"
+                   f"• {len(audio_files)} MP3 audio files\n\n"
+                   "Extract MP3s to your Anki media folder, then import the .txt file!"
+        )
         
         # Generate and send opinion texts with audio
+        await update.message.reply_text("⏳ Step 4/4: Generating opinion texts with audio...")
         perspectives = [
             ("positive", "Positive View", "😊"),
             ("negative", "Critical View", "🤔"),
@@ -249,7 +439,7 @@ async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"{emoji} **{name}:**\n\n{opinion_text}", parse_mode='Markdown')
             
             # Generate and send audio
-            await update.message.reply_text(f"🎤 Generating audio for {name.lower()}...")
+            await update.message.chat.send_action(action="record_audio")
             audio_data = generate_tts_chirp(opinion_text)
             
             if audio_data:
@@ -258,7 +448,7 @@ async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 audio_file.name = audio_filename
                 await update.message.reply_audio(audio=audio_file, filename=audio_filename)
             else:
-                await update.message.reply_text(f"❌ Audio generation failed for {name}. Text is still available above.")
+                await update.message.reply_text(f"⚠️ Could not generate audio for {name}. Text is still available above.")
         
         # Send discussion questions
         questions_text = "💬 **Discussion Questions:**\n\n"
@@ -267,11 +457,19 @@ async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await update.message.reply_text(questions_text, parse_mode='Markdown')
         
-        await update.message.reply_text("✅ All materials created! Happy learning! 加油！")
+        await update.message.reply_text(
+            "✅ All materials created! Happy learning! 加油！\n\n"
+            "📝 To use with Anki:\n"
+            "1. Download and extract the ZIP file\n"
+            "2. Copy all .mp3 files to your Anki media folder\n"
+            "3. Import the .txt file into Anki"
+        )
         
     except Exception as e:
-        await update.message.reply_text(f"❌ Error sending materials: {str(e)}")
+        await update.message.reply_text(f"❌ Error: {str(e)}\n\nPlease try again with a different topic.")
         print(f"Error: {str(e)}")
+    finally:
+        typing_task.cancel()
 
 def main():
     """Start the bot"""
