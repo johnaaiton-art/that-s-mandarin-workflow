@@ -3,7 +3,9 @@ import json
 import hashlib
 import re
 import zipfile
+import time
 from datetime import datetime
+from collections import defaultdict
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from openai import OpenAI
@@ -11,16 +13,63 @@ from google.cloud import texttospeech
 from google.oauth2 import service_account
 import asyncio
 from io import BytesIO
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # Environment variables
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 
+# Configuration
+class Config:
+    MAX_TOPIC_LENGTH = 100
+    MAX_VOCAB_ITEMS = 15
+    TTS_TIMEOUT = 30
+    API_RETRY_ATTEMPTS = 3
+    RATE_LIMIT_REQUESTS = 5
+    RATE_LIMIT_WINDOW = 3600  # 1 hour in seconds
+    MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB for Telegram
+
+config = Config()
+
 # Initialize DeepSeek client
 deepseek_client = OpenAI(
     api_key=DEEPSEEK_API_KEY,
     base_url="https://api.deepseek.com"
+)
+
+# Rate Limiter
+class RateLimiter:
+    def __init__(self, max_requests=5, window=3600):
+        self.requests = defaultdict(list)
+        self.max_requests = max_requests
+        self.window = window
+    
+    def is_allowed(self, user_id):
+        now = time.time()
+        user_requests = self.requests[user_id]
+        
+        # Remove old requests outside the time window
+        user_requests[:] = [req_time for req_time in user_requests 
+                          if now - req_time < self.window]
+        
+        if len(user_requests) >= self.max_requests:
+            return False
+        
+        user_requests.append(now)
+        return True
+    
+    def get_reset_time(self, user_id):
+        """Get time until rate limit resets"""
+        if not self.requests[user_id]:
+            return 0
+        oldest_request = min(self.requests[user_id])
+        reset_time = oldest_request + self.window - time.time()
+        return max(0, int(reset_time))
+
+rate_limiter = RateLimiter(
+    max_requests=config.RATE_LIMIT_REQUESTS,
+    window=config.RATE_LIMIT_WINDOW
 )
 
 def get_google_tts_client():
@@ -33,8 +82,35 @@ def get_google_tts_client():
         )
         return texttospeech.TextToSpeechClient(credentials=credentials)
     else:
-        # Fallback to default credentials if available
         return texttospeech.TextToSpeechClient()
+
+def validate_topic(topic):
+    """Validate and sanitize topic input"""
+    # Remove excessive whitespace
+    topic = re.sub(r'\s+', ' ', topic.strip())
+    
+    # Check for harmful patterns (command injection, path traversal)
+    if re.search(r'[<>"|&;`$()]', topic):
+        raise ValueError("Topic contains invalid characters")
+    
+    # Basic content moderation (Chinese and English)
+    inappropriate_patterns = [
+        r'\b(porn|sex|violence|hate|kill|death)\b',
+        r'\b(暴力|色情|仇恨|歧视|杀|死)\b',
+    ]
+    
+    for pattern in inappropriate_patterns:
+        if re.search(pattern, topic, re.IGNORECASE):
+            raise ValueError("Topic contains inappropriate content")
+    
+    # Enforce length limit
+    if len(topic) > config.MAX_TOPIC_LENGTH:
+        topic = topic[:config.MAX_TOPIC_LENGTH]
+    
+    if not topic:
+        raise ValueError("Topic cannot be empty")
+    
+    return topic
 
 def split_text_into_sentences(text, max_length=150):
     """Split text into smaller sentences for Chirp3"""
@@ -65,8 +141,13 @@ def split_text_into_sentences(text, max_length=150):
     
     return [s.strip() for s in final_result if s.strip()]
 
-def generate_tts_chirp(text):
-    """Generate Chinese TTS audio using Google Cloud Chirp3"""
+@retry(
+    stop=stop_after_attempt(2),
+    wait=wait_exponential(multiplier=1, min=2, max=5),
+    retry=retry_if_exception_type(Exception)
+)
+def generate_tts_chirp_sync(text):
+    """Generate Chinese TTS audio using Google Cloud Chirp3 (sync version)"""
     try:
         client = get_google_tts_client()
         
@@ -98,10 +179,15 @@ def generate_tts_chirp(text):
     except Exception as e:
         print(f"Chirp3 TTS Error: {str(e)}")
         # Try fallback to Wavenet
-        return generate_tts_wavenet(text)
+        return generate_tts_wavenet_sync(text)
 
-def generate_tts_wavenet(text):
-    """Fallback TTS using Wavenet"""
+@retry(
+    stop=stop_after_attempt(2),
+    wait=wait_exponential(multiplier=1, min=2, max=5),
+    retry=retry_if_exception_type(Exception)
+)
+def generate_tts_wavenet_sync(text):
+    """Fallback TTS using Wavenet (sync version)"""
     try:
         client = get_google_tts_client()
         
@@ -129,9 +215,13 @@ def generate_tts_wavenet(text):
         print(f"Wavenet TTS Error: {str(e)}")
         return None
 
-def generate_vocabulary_tts(chinese_text):
-    """Generate TTS for vocabulary items"""
-    return generate_tts_wavenet(chinese_text)
+async def generate_tts_async(text, use_chirp=True):
+    """Run TTS generation in thread pool"""
+    loop = asyncio.get_event_loop()
+    if use_chirp:
+        return await loop.run_in_executor(None, generate_tts_chirp_sync, text)
+    else:
+        return await loop.run_in_executor(None, generate_tts_wavenet_sync, text)
 
 def safe_filename(filename):
     """Sanitize filename to prevent path traversal (ZIP slip vulnerability)"""
@@ -140,6 +230,8 @@ def safe_filename(filename):
     filename = filename.replace('..', '').replace('/', '').replace('\\', '')
     # Get just the basename to strip any path components
     filename = os.path.basename(filename)
+    # Ensure reasonable length
+    filename = filename[:100]
     return filename.strip('_')
 
 def validate_deepseek_response(content):
@@ -154,6 +246,10 @@ def validate_deepseek_response(content):
     # Validate vocabulary is a list
     if not isinstance(content['vocabulary'], list):
         raise ValueError("vocabulary must be a list")
+    
+    # Limit vocabulary items
+    if len(content['vocabulary']) > config.MAX_VOCAB_ITEMS:
+        content['vocabulary'] = content['vocabulary'][:config.MAX_VOCAB_ITEMS]
     
     # Validate each vocabulary item has required fields
     for item in content['vocabulary']:
@@ -170,8 +266,16 @@ def validate_deepseek_response(content):
     
     return True
 
+@retry(
+    stop=stop_after_attempt(config.API_RETRY_ATTEMPTS),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    retry=retry_if_exception_type((Exception,)),
+    before_sleep=lambda retry_state: print(f"Retry attempt {retry_state.attempt_number} after error: {retry_state.outcome.exception()}")
+)
 def generate_content_with_deepseek(topic):
-    """Generate all content using DeepSeek API"""
+    """Generate all content using DeepSeek API with retry logic"""
+    print(f"[DeepSeek] Generating content for topic: {topic[:50]}...")
+    
     prompt = f"""You are a Chinese language teaching assistant. Create learning materials about the topic: "{topic}"
 
 Please generate a JSON response with the following structure:
@@ -202,15 +306,18 @@ Important requirements:
 5. Return ONLY valid JSON, no additional text"""
 
     try:
+        print(f"[DeepSeek] Sending request to API...")
         response = deepseek_client.chat.completions.create(
             model="deepseek-chat",
             messages=[
                 {"role": "system", "content": "You are a Chinese language teaching expert who creates engaging, natural content at HSK4 level. Always respond with valid JSON only."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.7
+            temperature=0.7,
+            timeout=45.0
         )
         
+        print(f"[DeepSeek] Received response, parsing...")
         content_text = response.choices[0].message.content
         
         # Try to extract JSON if there's extra text
@@ -221,38 +328,57 @@ Important requirements:
         # Parse JSON
         content = json.loads(content_text)
         
+        print(f"[DeepSeek] JSON parsed successfully")
+        
         # Validate structure
         validate_deepseek_response(content)
         
+        print(f"[DeepSeek] Validation passed, returning content")
         return content
     
     except json.JSONDecodeError as e:
-        print(f"JSON parsing error: {str(e)}")
-        return None
+        print(f"[ERROR] JSON parsing error: {str(e)}")
+        print(f"[ERROR] Raw content: {content_text[:200]}...")
+        raise
     except ValueError as e:
-        print(f"Validation error: {str(e)}")
-        return None
+        print(f"[ERROR] Validation error: {str(e)}")
+        raise
     except Exception as e:
-        print(f"DeepSeek API Error: {str(e)}")
-        return None
+        print(f"[ERROR] DeepSeek API Error: {type(e).__name__}: {str(e)}")
+        raise
 
-def create_vocabulary_file_with_tts(vocabulary, topic):
+async def create_vocabulary_file_with_tts(vocabulary, topic, progress_callback=None):
     """Create tab-delimited vocabulary file with TTS audio tags and return audio files"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_topic_name = safe_filename(topic)
     filename = f"{safe_topic_name}_{timestamp}_vocabulary.txt"
     
     content = ""
-    audio_files = {}  # Dictionary to store audio data: {filename: audio_bytes}
+    audio_files = {}
     
+    total_items = len(vocabulary)
+    
+    # Generate TTS for all vocabulary items concurrently
+    tts_tasks = []
     for item in vocabulary:
+        tts_tasks.append(generate_tts_async(item['chinese'], use_chirp=False))
+    
+    # Await all TTS generations
+    audio_results = await asyncio.gather(*tts_tasks, return_exceptions=True)
+    
+    for idx, (item, audio_data) in enumerate(zip(vocabulary, audio_results)):
         chinese_text = item['chinese']
         
-        # Generate TTS audio
-        audio_data = generate_vocabulary_tts(chinese_text)
+        if progress_callback:
+            await progress_callback(idx + 1, total_items)
         
-        if audio_data:
-            # Create filename using MD5 hash (same as original code)
+        # Check if audio generation succeeded
+        if isinstance(audio_data, Exception) or not audio_data:
+            print(f"TTS failed for '{chinese_text}': {audio_data if isinstance(audio_data, Exception) else 'No data'}")
+            # Add row without audio
+            content += f"{item['english']}\t{item['chinese']}\t{item['pinyin']}\n"
+        else:
+            # Create filename using MD5 hash
             hash_object = hashlib.md5(chinese_text.encode())
             audio_filename = f"tts_{hash_object.hexdigest()}.mp3"
             
@@ -267,9 +393,6 @@ def create_vocabulary_file_with_tts(vocabulary, topic):
             
             # Add row with 4 columns: english, chinese, pinyin, audio_tag
             content += f"{item['english']}\t{item['chinese']}\t{item['pinyin']}\t{anki_tag}\n"
-        else:
-            # If TTS fails, just add 3 columns without audio
-            content += f"{item['english']}\t{item['chinese']}\t{item['pinyin']}\n"
     
     return filename, content, audio_files
 
@@ -292,184 +415,644 @@ def create_zip_package(vocab_filename, vocab_content, audio_files, topic, timest
             zip_file.writestr(safe_audio_filename, audio_data)
     
     zip_buffer.seek(0)
+    
+    # Check file size
+    file_size = zip_buffer.getbuffer().nbytes
+    if file_size > config.MAX_FILE_SIZE:
+        raise ValueError(f"ZIP file too large: {file_size / 1024 / 1024:.1f}MB (max: {config.MAX_FILE_SIZE / 1024 / 1024}MB)")
+    
     return zip_filename, zip_buffer
+
+def format_vocabulary_preview(vocabulary):
+    """Format vocabulary for preview message"""
+    message = "📚 **Vocabulary Preview:**\n\n"
+    preview_count = min(5, len(vocabulary))
+    
+    for i, item in enumerate(vocabulary[:preview_count], 1):
+        message += f"{i}. **{item['chinese']}** ({item['pinyin']}) - {item['english']}\n"
+    
+    if len(vocabulary) > preview_count:
+        message += f"\n... and {len(vocabulary) - preview_count} more items in the ZIP file"
+    
+    return message
+
+def create_html_document(topic, content, timestamp):
+    """Create a beautiful HTML document with all learning materials"""
+    safe_topic = safe_filename(topic)
+    html_filename = f"{safe_topic}_{timestamp}_materials.html"
+    
+    # Build vocabulary table HTML
+    vocab_rows = ""
+    for i, item in enumerate(content['vocabulary'], 1):
+        vocab_rows += f"""
+        <tr>
+            <td>{i}</td>
+            <td class="chinese">{item['chinese']}</td>
+            <td class="pinyin">{item['pinyin']}</td>
+            <td>{item['english']}</td>
+        </tr>
+        """
+    
+    # Build discussion questions HTML
+    questions_html = ""
+    for i, question in enumerate(content['discussion_questions'], 1):
+        questions_html += f"""
+        <div class="question">
+            <span class="question-number">{i}</span>
+            <span class="question-text">{question}</span>
+        </div>
+        """
+    
+    html_content = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chinese Learning Materials: {topic}</title>
+    <style>
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }}
+        
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+            line-height: 1.8;
+            color: #333;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 20px;
+            min-height: 100vh;
+        }}
+        
+        .container {{
+            max-width: 900px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }}
+        
+        .header {{
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 40px;
+            text-align: center;
+        }}
+        
+        .header h1 {{
+            font-size: 2em;
+            margin-bottom: 10px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
+        }}
+        
+        .header .subtitle {{
+            font-size: 0.9em;
+            opacity: 0.9;
+        }}
+        
+        .content {{
+            padding: 40px;
+        }}
+        
+        .section {{
+            margin-bottom: 50px;
+        }}
+        
+        .section-title {{
+            font-size: 1.8em;
+            color: #667eea;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 3px solid #667eea;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }}
+        
+        .section-icon {{
+            font-size: 1.2em;
+        }}
+        
+        .main-text {{
+            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            padding: 30px;
+            border-radius: 15px;
+            font-size: 1.3em;
+            line-height: 2;
+            color: #2c3e50;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+        }}
+        
+        .chinese {{
+            font-size: 1.2em;
+            font-weight: 600;
+            color: #2c3e50;
+        }}
+        
+        .pinyin {{
+            color: #7f8c8d;
+            font-style: italic;
+        }}
+        
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+            border-radius: 10px;
+            overflow: hidden;
+        }}
+        
+        thead {{
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }}
+        
+        th {{
+            padding: 15px;
+            text-align: left;
+            font-weight: 600;
+        }}
+        
+        tbody tr:nth-child(even) {{
+            background: #f8f9fa;
+        }}
+        
+        tbody tr:hover {{
+            background: #e9ecef;
+            transition: background 0.3s;
+        }}
+        
+        td {{
+            padding: 15px;
+            border-bottom: 1px solid #dee2e6;
+        }}
+        
+        .opinion-card {{
+            background: white;
+            border-radius: 15px;
+            padding: 25px;
+            margin-bottom: 20px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+            border-left: 5px solid;
+        }}
+        
+        .opinion-positive {{
+            border-left-color: #2ecc71;
+        }}
+        
+        .opinion-negative {{
+            border-left-color: #e74c3c;
+        }}
+        
+        .opinion-balanced {{
+            border-left-color: #f39c12;
+        }}
+        
+        .opinion-header {{
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 15px;
+            font-size: 1.3em;
+            font-weight: 600;
+        }}
+        
+        .opinion-text {{
+            font-size: 1.1em;
+            line-height: 2;
+            color: #2c3e50;
+        }}
+        
+        .question {{
+            background: #f8f9fa;
+            padding: 20px;
+            margin-bottom: 15px;
+            border-radius: 10px;
+            display: flex;
+            gap: 15px;
+            align-items: start;
+            box-shadow: 0 3px 10px rgba(0,0,0,0.05);
+        }}
+        
+        .question-number {{
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            width: 35px;
+            height: 35px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            flex-shrink: 0;
+        }}
+        
+        .question-text {{
+            font-size: 1.1em;
+            line-height: 1.8;
+            color: #2c3e50;
+        }}
+        
+        .footer {{
+            background: #f8f9fa;
+            padding: 30px;
+            text-align: center;
+            color: #6c757d;
+            border-top: 1px solid #dee2e6;
+        }}
+        
+        @media print {{
+            body {{
+                background: white;
+                padding: 0;
+            }}
+            .container {{
+                box-shadow: none;
+            }}
+        }}
+        
+        @media (max-width: 768px) {{
+            .content {{
+                padding: 20px;
+            }}
+            .header {{
+                padding: 30px 20px;
+            }}
+            .main-text {{
+                font-size: 1.1em;
+            }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🎓 Chinese Learning Materials</h1>
+            <div class="subtitle">Topic: {topic}</div>
+            <div class="subtitle">Generated: {datetime.now().strftime("%Y-%m-%d %H:%M")}</div>
+        </div>
+        
+        <div class="content">
+            <!-- Main Text -->
+            <div class="section">
+                <h2 class="section-title">
+                    <span class="section-icon">📖</span>
+                    Main Text
+                </h2>
+                <div class="main-text">{content['main_text']}</div>
+            </div>
+            
+            <!-- Vocabulary -->
+            <div class="section">
+                <h2 class="section-title">
+                    <span class="section-icon">📚</span>
+                    Vocabulary List
+                </h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>#</th>
+                            <th>Chinese</th>
+                            <th>Pinyin</th>
+                            <th>English</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {vocab_rows}
+                    </tbody>
+                </table>
+            </div>
+            
+            <!-- Opinion Texts -->
+            <div class="section">
+                <h2 class="section-title">
+                    <span class="section-icon">💭</span>
+                    Different Perspectives
+                </h2>
+                
+                <div class="opinion-card opinion-positive">
+                    <div class="opinion-header">
+                        <span>😊</span>
+                        <span>Positive View</span>
+                    </div>
+                    <div class="opinion-text">{content['opinion_texts']['positive']}</div>
+                </div>
+                
+                <div class="opinion-card opinion-negative">
+                    <div class="opinion-header">
+                        <span>🤔</span>
+                        <span>Critical View</span>
+                    </div>
+                    <div class="opinion-text">{content['opinion_texts']['negative']}</div>
+                </div>
+                
+                <div class="opinion-card opinion-balanced">
+                    <div class="opinion-header">
+                        <span>⚖️</span>
+                        <span>Balanced View</span>
+                    </div>
+                    <div class="opinion-text">{content['opinion_texts']['balanced']}</div>
+                </div>
+            </div>
+            
+            <!-- Discussion Questions -->
+            <div class="section">
+                <h2 class="section-title">
+                    <span class="section-icon">💬</span>
+                    Discussion Questions
+                </h2>
+                {questions_html}
+            </div>
+        </div>
+        
+        <div class="footer">
+            <p>Generated by Chinese Learning Bot 🤖</p>
+            <p>HSK4 Level Materials</p>
+        </div>
+    </div>
+</body>
+</html>"""
+    
+    return html_filename, html_content
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send a message when the command /start is issued."""
     await update.message.reply_text(
-        "欢迎! Welcome to the Chinese Learning Bot!\n\n"
-        "Simply send me a topic (e.g., '大城市生活的压力', 'environmental protection', etc.) "
-        "and I'll create:\n"
-        "📄 A reading text\n"
+        "欢迎! Welcome to the Chinese Learning Bot! 🎓\n\n"
+        "Simply send me a topic and I'll create comprehensive learning materials:\n\n"
+        "📄 Reading text (HSK4 level)\n"
         "📝 Vocabulary list with TTS audio\n"
-        "🎤 3 opinion texts with audio\n"
+        "🎤 3 opinion texts with audio (positive, critical, balanced)\n"
         "💬 Discussion questions\n"
         "📦 ZIP package for Anki import\n\n"
-        "Just type your topic to begin!"
+        "**Rate Limit:** 5 requests per hour\n\n"
+        "Just type your topic to begin!\n"
+        "Example: '社交媒体的影响' or 'work-life balance'"
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send a message when the command /help is issued."""
-    await update.message.reply_text(
-        "How to use:\n"
-        "1. Send me any topic in English or Chinese (max 100 characters)\n"
-        "2. Wait while I generate materials (takes about 30-60 seconds)\n"
-        "3. You'll receive:\n"
-        "   - Vocabulary file with TTS tags (.txt)\n"
-        "   - 3 audio files with different perspectives\n"
-        "   - 3 opinion texts\n"
-        "   - Discussion questions\n"
-        "   - ZIP package with vocabulary + MP3s for Anki\n\n"
-        "📦 For Anki import:\n"
-        "   - Download the ZIP file\n"
-        "   - Extract MP3 files to your Anki collection.media folder\n"
-        "   - Import the .txt file into Anki\n"
-        "   - See Anki documentation for your platform's media folder location\n\n"
-        "Example topics:\n"
-        "- 社交媒体的影响\n"
-        "- work-life balance\n"
-        "- 环境保护\n"
-        "- modern technology"
+    user_id = update.effective_user.id
+    reset_time = rate_limiter.get_reset_time(user_id)
+    
+    help_text = (
+        "📖 **How to Use:**\n\n"
+        "1. Send me any topic (max 100 characters)\n"
+        "2. Wait 30-60 seconds for generation\n"
+        "3. Receive comprehensive materials:\n"
+        "   • Vocabulary file with TTS tags\n"
+        "   • 3 audio files (different perspectives)\n"
+        "   • Discussion questions\n"
+        "   • ZIP package for Anki\n\n"
+        "📦 **For Anki Import:**\n"
+        "1. Download the ZIP file\n"
+        "2. Extract MP3 files to your Anki collection.media folder\n"
+        "3. Import the .txt file into Anki\n"
+        "4. See Anki docs for your platform's media folder location\n\n"
+        "⚡ **Rate Limit:** 5 requests per hour\n"
     )
+    
+    if reset_time > 0:
+        help_text += f"⏱️ Your limit resets in {reset_time // 60} minutes\n\n"
+    
+    help_text += (
+        "💡 **Example Topics:**\n"
+        "• 社交媒体的影响\n"
+        "• work-life balance\n"
+        "• 环境保护\n"
+        "• modern technology\n"
+        "• 城市生活的压力"
+    )
+    
+    await update.message.reply_text(help_text, parse_mode='Markdown')
 
 async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle topic message and generate all materials"""
-    topic = update.message.text.strip()
+    user_id = update.effective_user.id
+    topic_raw = update.message.text.strip()
     
-    # Input validation
-    if len(topic) > 100:
-        await update.message.reply_text("❌ Topic too long! Please keep it under 100 characters.")
+    # Check rate limit
+    if not rate_limiter.is_allowed(user_id):
+        reset_time = rate_limiter.get_reset_time(user_id)
+        await update.message.reply_text(
+            f"⏱️ Rate limit reached!\n\n"
+            f"You've used your 5 requests for this hour.\n"
+            f"Please try again in {reset_time // 60} minutes.\n\n"
+            f"This helps manage API costs. Thank you for understanding! 🙏"
+        )
         return
     
-    if not topic:
-        await update.message.reply_text("❌ Please send a topic to generate materials.")
+    # Validate and sanitize topic
+    try:
+        topic = validate_topic(topic_raw)
+    except ValueError as e:
+        await update.message.reply_text(f"❌ Invalid topic: {str(e)}\n\nPlease try a different topic.")
         return
     
-    # Send typing action
+    # Send initial message with typing action
     await update.message.chat.send_action(action="typing")
     
-    await update.message.reply_text(f"📚 正在创建关于 '{topic}' 的学习材料...\n"
-                                   f"Creating materials about '{topic}'...\n"
-                                   f"This will take about 30-60 seconds...")
+    progress_msg = await update.message.reply_text(
+        f"📚 Creating materials about '{topic}'...\n\n"
+        f"⏳ Progress: 0/5\n"
+        f"⬜⬜⬜⬜⬜\n"
+        f"Initializing..."
+    )
     
-    # Send periodic typing updates
-    async def send_typing_updates():
-        for _ in range(12):  # 60 seconds / 5 seconds each
-            await asyncio.sleep(5)
-            try:
-                await update.message.chat.send_action(action="typing")
-            except:
-                break
-    
-    typing_task = asyncio.create_task(send_typing_updates())
+    # Progress tracking
+    async def update_progress(step, message):
+        progress_bar = "🟩" * step + "⬜" * (5 - step)
+        try:
+            await progress_msg.edit_text(
+                f"📚 Creating materials about '{topic}'...\n\n"
+                f"⏳ Progress: {step}/5\n"
+                f"{progress_bar}\n"
+                f"{message}"
+            )
+        except:
+            pass  # Ignore edit errors
     
     try:
-        # Generate content with DeepSeek
-        await update.message.reply_text("⏳ Step 1/4: Generating content with AI...")
-        content = generate_content_with_deepseek(topic)
+        # Step 1: Generate content with DeepSeek
+        await update_progress(1, "🤖 Generating content with AI...")
+        await update.message.chat.send_action(action="typing")
+        
+        print(f"[Bot] Starting content generation for user {user_id}, topic: {topic[:50]}")
+        
+        try:
+            content = generate_content_with_deepseek(topic)
+        except Exception as e:
+            print(f"[Bot] Content generation failed: {type(e).__name__}: {str(e)}")
+            raise
         
         if not content:
-            await update.message.reply_text("❌ Sorry, there was an error generating content. Please try again with a different topic.")
-            typing_task.cancel()
+            await update.message.reply_text(
+                "❌ Failed to generate content. Please try again with a different topic.\n\n"
+                "If the problem persists, the topic might be too complex or controversial."
+            )
             return
         
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_topic = safe_filename(topic)
         
-        # Send main text
-        await update.message.reply_text(f"📖 **Main Text:**\n\n{content['main_text']}", parse_mode='Markdown')
+        # Step 2: Create and send HTML document
+        await update_progress(2, "📄 Creating HTML document...")
         
-        # Validate vocabulary items are from main text
-        main_text = content['main_text']
-        missing_vocab = []
-        for item in content['vocabulary']:
-            if item['chinese'] not in main_text:
-                missing_vocab.append(item['chinese'])
+        html_filename, html_content = create_html_document(topic, content, timestamp)
+        html_file = BytesIO(html_content.encode('utf-8'))
+        html_file.name = html_filename
         
-        if missing_vocab:
-            await update.message.reply_text(
-                f"⚠️ Note: {len(missing_vocab)} vocabulary items may not be from the main text. "
-                f"This sometimes happens with AI generation."
-            )
+        await update.message.reply_document(
+            document=html_file,
+            filename=html_filename,
+            caption="📄 **Learning Materials Document**\n\nOpen this HTML file in your browser for a beautifully formatted view of all materials!"
+        )
         
-        # Create vocabulary file with TTS
-        await update.message.reply_text("⏳ Step 2/4: Generating TTS audio for vocabulary items...")
-        vocab_filename, vocab_content, audio_files = create_vocabulary_file_with_tts(
+        # Send vocabulary preview in chat
+        vocab_preview = format_vocabulary_preview(content['vocabulary'])
+        await update.message.reply_text(vocab_preview, parse_mode='Markdown')
+        
+        # Step 3: Create vocabulary file with TTS
+        await update_progress(3, "🎵 Generating TTS audio for vocabulary...")
+        await update.message.chat.send_action(action="record_voice")
+        
+        async def vocab_progress(current, total):
+            if current % 3 == 0:  # Update every 3 items
+                await update_progress(3, f"🎵 Generating TTS audio... ({current}/{total})")
+        
+        vocab_filename, vocab_content, audio_files = await create_vocabulary_file_with_tts(
             content['vocabulary'], 
-            safe_topic
+            safe_topic,
+            progress_callback=vocab_progress
         )
         
         if not audio_files:
-            await update.message.reply_text("⚠️ Warning: Could not generate TTS audio for vocabulary. Continuing without audio...")
+            await update.message.reply_text("⚠️ Warning: Could not generate TTS audio for vocabulary.")
         
-        # Create ZIP package
-        await update.message.reply_text("⏳ Step 3/4: Creating Anki import package...")
-        zip_filename, zip_buffer = create_zip_package(
-            vocab_filename, 
-            vocab_content, 
-            audio_files, 
-            safe_topic, 
-            timestamp
-        )
+        # Step 4: Create ZIP package (now includes HTML file)
+        await update_progress(4, "📦 Creating Anki import package...")
         
-        # Send ZIP file
-        zip_buffer.name = zip_filename
-        await update.message.reply_document(
-            document=zip_buffer, 
-            filename=zip_filename,
-            caption="📦 Anki Import Package\n\n"
-                   "Contains:\n"
-                   f"• {vocab_filename} (vocabulary with TTS tags)\n"
-                   f"• {len(audio_files)} MP3 audio files\n\n"
-                   "Extract MP3s to your Anki media folder, then import the .txt file!"
-        )
+        try:
+            # Get HTML content for ZIP
+            html_filename, html_content = create_html_document(topic, content, timestamp)
+            
+            # Create enhanced ZIP with HTML
+            zip_filename = f"{safe_topic}_{timestamp}_complete_package.zip"
+            zip_buffer = BytesIO()
+            
+            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                # Add vocabulary text file
+                safe_vocab_filename = safe_filename(vocab_filename)
+                zip_file.writestr(safe_vocab_filename, vocab_content.encode('utf-8'))
+                
+                # Add HTML document
+                safe_html_filename = safe_filename(html_filename)
+                zip_file.writestr(safe_html_filename, html_content.encode('utf-8'))
+                
+                # Add all audio files
+                for audio_filename, audio_data in audio_files.items():
+                    safe_audio_filename = safe_filename(audio_filename)
+                    zip_file.writestr(safe_audio_filename, audio_data)
+            
+            zip_buffer.seek(0)
+            
+            # Check file size
+            file_size = zip_buffer.getbuffer().nbytes
+            if file_size > config.MAX_FILE_SIZE:
+                raise ValueError(f"ZIP file too large: {file_size / 1024 / 1024:.1f}MB")
+            
+            # Send ZIP file
+            zip_buffer.name = zip_filename
+            await update.message.reply_document(
+                document=zip_buffer, 
+                filename=zip_filename,
+                caption=f"📦 **Complete Learning Package**\n\n"
+                       f"Contains:\n"
+                       f"• {html_filename} (Beautiful HTML document)\n"
+                       f"• {vocab_filename} (Anki vocabulary file)\n"
+                       f"• {len(audio_files)} MP3 audio files\n\n"
+                       f"Open the HTML file in your browser to view all materials!"
+            )
+        except ValueError as e:
+            await update.message.reply_text(f"⚠️ {str(e)}")
+            # Send files separately if ZIP is too large
+            html_file = BytesIO(html_content.encode('utf-8'))
+            html_file.name = html_filename
+            await update.message.reply_document(document=html_file, filename=html_filename)
+            
+            vocab_file = BytesIO(vocab_content.encode('utf-8'))
+            vocab_file.name = vocab_filename
+            await update.message.reply_document(document=vocab_file, filename=vocab_filename)
         
-        # Generate and send opinion texts with audio
-        await update.message.reply_text("⏳ Step 4/4: Generating opinion texts with audio...")
+        # Step 5: Generate and send opinion texts with audio
+        await update_progress(5, "🎤 Generating opinion texts with audio...")
+        
         perspectives = [
             ("positive", "Positive View", "😊"),
             ("negative", "Critical View", "🤔"),
             ("balanced", "Balanced View", "⚖️")
         ]
         
+        # Generate all opinion audio concurrently
+        opinion_tasks = []
         for key, name, emoji in perspectives:
+            opinion_tasks.append(generate_tts_async(content['opinion_texts'][key], use_chirp=True))
+        
+        opinion_audios = await asyncio.gather(*opinion_tasks, return_exceptions=True)
+        
+        for (key, name, emoji), audio_data in zip(perspectives, opinion_audios):
             opinion_text = content['opinion_texts'][key]
             
             # Send text
             await update.message.reply_text(f"{emoji} **{name}:**\n\n{opinion_text}", parse_mode='Markdown')
             
-            # Generate and send audio
-            await update.message.chat.send_action(action="record_audio")
-            audio_data = generate_tts_chirp(opinion_text)
-            
-            if audio_data:
+            # Send audio if generation succeeded
+            if not isinstance(audio_data, Exception) and audio_data:
                 audio_filename = f"{safe_topic}_{timestamp}_{key}.mp3"
                 audio_file = BytesIO(audio_data)
                 audio_file.name = audio_filename
                 await update.message.reply_audio(audio=audio_file, filename=audio_filename)
             else:
-                await update.message.reply_text(f"⚠️ Could not generate audio for {name}. Text is still available above.")
+                await update.message.reply_text(f"⚠️ Could not generate audio for {name}.")
         
-        # Send discussion questions
+        # Send discussion questions (keeping in chat for quick reference)
         questions_text = "💬 **Discussion Questions:**\n\n"
         for i, question in enumerate(content['discussion_questions'], 1):
             questions_text += f"{i}. {question}\n"
         
         await update.message.reply_text(questions_text, parse_mode='Markdown')
         
+        # Final success message
+        await progress_msg.edit_text(
+            f"✅ **Complete!**\n\n"
+            f"All materials created successfully!\n"
+            f"Happy learning! 加油！ 🎓"
+        )
+        
         await update.message.reply_text(
-            "✅ All materials created! Happy learning! 加油！\n\n"
-            "📝 To use with Anki:\n"
-            "1. Download and extract the ZIP file\n"
-            "2. Copy all .mp3 files to your Anki media folder\n"
-            "3. Import the .txt file into Anki"
+            "📝 **To use the materials:**\n\n"
+            "📄 **HTML File:** Open in your browser for beautiful reading\n"
+            "📚 **For Anki:**\n"
+            "   1. Extract the ZIP file\n"
+            "   2. Copy MP3 files to Anki's media folder\n"
+            "   3. Import the .txt file into Anki\n\n"
+            "Need help? Send /help"
         )
         
     except Exception as e:
-        await update.message.reply_text(f"❌ Error: {str(e)}\n\nPlease try again with a different topic.")
-        print(f"Error: {str(e)}")
-    finally:
-        typing_task.cancel()
+        error_msg = str(e)
+        await update.message.reply_text(
+            f"❌ **Error occurred:**\n{error_msg}\n\n"
+            f"Please try again with a different topic or contact support if the issue persists.\n\n"
+            f"Suggestions:\n"
+            f"• Try a simpler or more specific topic\n"
+            f"• Avoid very long or complex phrases\n"
+            f"• Check that your topic is appropriate"
+        )
+        print(f"Error for user {user_id}, topic '{topic}': {error_msg}")
 
 def main():
     """Start the bot"""
@@ -480,6 +1063,11 @@ def main():
     if not DEEPSEEK_API_KEY:
         print("Error: DEEPSEEK_API_KEY not found in environment variables")
         return
+    
+    print("Bot configuration:")
+    print(f"- Rate limit: {config.RATE_LIMIT_REQUESTS} requests per {config.RATE_LIMIT_WINDOW // 3600} hour(s)")
+    print(f"- Max topic length: {config.MAX_TOPIC_LENGTH} characters")
+    print(f"- API retry attempts: {config.API_RETRY_ATTEMPTS}")
     
     # Create the Application
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
