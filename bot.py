@@ -696,14 +696,7 @@ def create_html_document(topic, content, timestamp):
         </div>
         
         <div class="content">
-            <!-- Main Text -->
-            <div class="section">
-                <h2 class="section-title">
-                    <span class="section-icon">📖</span>
-                    Main Text
-                </h2>
-                <div class="main-text">{content['main_text']}</div>
-            </div>
+           
             
             <!-- Vocabulary -->
             <div class="section">
@@ -724,6 +717,14 @@ def create_html_document(topic, content, timestamp):
                         {vocab_rows}
                     </tbody>
                 </table>
+            </div>
+             <!-- Main Text -->
+            <div class="section">
+                <h2 class="section-title">
+                    <span class="section-icon">📖</span>
+                    Main Text
+                </h2>
+                <div class="main-text">{content['main_text']}</div>
             </div>
             
             <!-- Opinion Texts -->
@@ -781,16 +782,8 @@ def create_html_document(topic, content, timestamp):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send a message when the command /start is issued."""
     await update.message.reply_text(
-        "欢迎! Welcome to the Chinese Learning Bot! 🎓\n\n"
-        "Simply send me a topic and I'll create comprehensive learning materials:\n\n"
-        "📄 Reading text (HSK5 level, 250 characters)\n"
-        "📝 Vocabulary list with TTS audio (HSK5 collocations & phrases)\n"
-        "🎤 3 opinion texts with audio (positive, critical, balanced)\n"
-        "💬 Discussion questions\n"
-        "📦 Complete package: HTML document + Anki files\n\n"
-        "**Rate Limit:** 5 requests per hour\n\n"
-        "Just type your topic to begin!\n"
-        "Example: '社交媒体的影响' or 'work-life balance'"
+        "欢迎! Enter your topic,detailed without being too long! 🎓\n\n"
+        
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1029,17 +1022,11 @@ async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Final success message
         await progress_msg.edit_text(
             f"✅ **Complete!**\n\n"
-            f"All materials created successfully!\n"
-            f"Happy learning! 加油！ 🎓"
+            
         )
         
         await update.message.reply_text(
-            "📝 **To use the materials:**\n\n"
-            "📄 **HTML File:** Open in your browser for beautiful reading\n"
-            "📚 **For Anki:**\n"
-            "   1. Extract the ZIP file\n"
-            "   2. Copy MP3 files to Anki's media folder\n"
-            "   3. Import the .txt file into Anki\n\n"
+           
             "Need help? Send /help"
         )
         
