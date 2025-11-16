@@ -947,7 +947,7 @@ async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
             opinion_text = content['opinion_texts'][key]
             
             # Send text
-            await update.message.reply_text(f"{emoji} **{name}:**\n\n{opinion_text}", parse_mode='Markdown')
+            #await update.message.reply_text(f"{emoji} **{name}:**\n\n{opinion_text}", parse_mode='Markdown')
             
             # Send audio if generation succeeded
             if not isinstance(audio_data, Exception) and audio_data:
