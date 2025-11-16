@@ -160,13 +160,14 @@ def split_text_into_sentences(text, max_length=150):
     wait=wait_exponential(multiplier=1, min=2, max=5),
     retry=retry_if_exception_type(Exception)
 )
-def generate_tts_chirp3_sync(text, voice_name=None):
+def generate_tts_chirp3_sync(text, voice_name=None, speaking_rate=1.0):
     """
     Generate Chinese TTS audio using Google Cloud Chirp3 (sync version)
     
     Args:
         text: Chinese text to convert to speech
         voice_name: Specific Chirp3 voice to use. If None, randomly selects from config.CHIRP3_VOICES
+        speaking_rate: Speed of speech (0.25 to 2.0). Default 1.0. Lower = slower.
     """
     try:
         client = get_google_tts_client()
@@ -175,7 +176,10 @@ def generate_tts_chirp3_sync(text, voice_name=None):
         if voice_name is None:
             voice_name = random.choice(config.CHIRP3_VOICES)
         
-        print(f"[TTS] Generating audio for '{text[:30]}...' with voice {voice_name}")
+        # Clamp speaking_rate to valid range [0.25, 2.0]
+        speaking_rate = max(0.25, min(2.0, speaking_rate))
+        
+        print(f"[TTS] Generating audio for '{text[:30]}...' with voice {voice_name}, speed {speaking_rate}")
         
         # For Chirp3, don't split - send full text
         # Chirp3 handles longer text better than older models
@@ -187,9 +191,10 @@ def generate_tts_chirp3_sync(text, voice_name=None):
             name=voice_name
         )
         
-        # Chirp3 doesn't support pitch or speaking_rate
+        # Chirp3 supports speaking_rate in AudioConfig (not pitch)
         audio_config = texttospeech.AudioConfig(
-            audio_encoding=texttospeech.AudioEncoding.MP3
+            audio_encoding=texttospeech.AudioEncoding.MP3,
+            speaking_rate=speaking_rate
         )
         
         response = client.synthesize_speech(
@@ -210,16 +215,17 @@ def generate_tts_chirp3_sync(text, voice_name=None):
         traceback.print_exc()
         raise
 
-async def generate_tts_async(text, voice_name=None):
+async def generate_tts_async(text, voice_name=None, speaking_rate=1.0):
     """
     Run TTS generation in thread pool
     
     Args:
         text: Chinese text to convert to speech
         voice_name: Specific Chirp3 voice to use. If None, randomly selects
+        speaking_rate: Speed of speech (0.25 to 2.0). Default 1.0.
     """
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, generate_tts_chirp3_sync, text, voice_name)
+    return await loop.run_in_executor(None, generate_tts_chirp3_sync, text, voice_name, speaking_rate)
 
 def safe_filename(filename):
     """Sanitize filename to prevent path traversal (ZIP slip vulnerability)"""
@@ -361,11 +367,11 @@ async def create_vocabulary_file_with_tts(vocabulary, topic, progress_callback=N
     
     total_items = len(vocabulary)
     
-    # Generate TTS for all vocabulary items concurrently using Leda voice
+    # Generate TTS for all vocabulary items concurrently using Leda voice at 80% speed
     tts_tasks = []
     for item in vocabulary:
-        # Use the fixed Anki voice (Leda) for vocabulary cards
-        tts_tasks.append(generate_tts_async(item['chinese'], voice_name=config.ANKI_VOICE))
+        # Use the fixed Anki voice (Leda) at 0.8 speed for vocabulary cards
+        tts_tasks.append(generate_tts_async(item['chinese'], voice_name=config.ANKI_VOICE, speaking_rate=0.8))
     
     # Await all TTS generations
     audio_results = await asyncio.gather(*tts_tasks, return_exceptions=True)
@@ -946,11 +952,11 @@ async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ("balanced", "Balanced View", "⚖️")
         ]
         
-        # Generate all opinion audio concurrently with randomly selected voices
+        # Generate all opinion audio concurrently with randomly selected voices at 85% speed
         opinion_tasks = []
         for key, name, emoji in perspectives:
-            # Each opinion text gets a randomly selected Chirp3 voice
-            opinion_tasks.append(generate_tts_async(content['opinion_texts'][key], voice_name=None))
+            # Each opinion text gets a randomly selected Chirp3 voice at 0.85 speed
+            opinion_tasks.append(generate_tts_async(content['opinion_texts'][key], voice_name=None, speaking_rate=0.85))
         
         opinion_audios = await asyncio.gather(*opinion_tasks, return_exceptions=True)
         
@@ -1017,8 +1023,8 @@ def main():
     print(f"- Content level: HSK5 (250 character main text)")
     print(f"- Vocabulary focus: Collocations and phrases")
     print(f"- TTS voices:")
-    print(f"  • Anki vocabulary: {config.ANKI_VOICE}")
-    print(f"  • Opinion texts: Random selection from {len(config.CHIRP3_VOICES)} Chirp3 HD voices")
+    print(f"  • Anki vocabulary: {config.ANKI_VOICE} at 80% speed (0.8)")
+    print(f"  • Opinion texts: Random selection from {len(config.CHIRP3_VOICES)} Chirp3 HD voices at 85% speed (0.85)")
     
     # Create the Application
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
