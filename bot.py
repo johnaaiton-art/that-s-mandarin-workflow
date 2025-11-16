@@ -175,34 +175,39 @@ def generate_tts_chirp3_sync(text, voice_name=None):
         if voice_name is None:
             voice_name = random.choice(config.CHIRP3_VOICES)
         
-        # Split text into manageable sentences for better quality
-        sentences = split_text_into_sentences(text, max_length=150)
+        print(f"[TTS] Generating audio for '{text[:30]}...' with voice {voice_name}")
         
-        all_audio = b""
-        for sentence in sentences:
-            synthesis_input = texttospeech.SynthesisInput(text=sentence)
-            voice = texttospeech.VoiceSelectionParams(
-                language_code="cmn-CN",
-                name=voice_name,
-                ssml_gender=texttospeech.SsmlVoiceGender.FEMALE
-            )
-            
-            audio_config = texttospeech.AudioConfig(
-                audio_encoding=texttospeech.AudioEncoding.MP3
-            )
-            
-            response = client.synthesize_speech(
-                input=synthesis_input,
-                voice=voice,
-                audio_config=audio_config
-            )
-            
-            all_audio += response.audio_content
+        # For Chirp3, don't split - send full text
+        # Chirp3 handles longer text better than older models
+        synthesis_input = texttospeech.SynthesisInput(text=text)
         
-        return all_audio
+        # Chirp3 voices don't support ssml_gender parameter
+        voice = texttospeech.VoiceSelectionParams(
+            language_code="cmn-CN",
+            name=voice_name
+        )
+        
+        # Chirp3 doesn't support pitch or speaking_rate
+        audio_config = texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.MP3
+        )
+        
+        response = client.synthesize_speech(
+            input=synthesis_input,
+            voice=voice,
+            audio_config=audio_config
+        )
+        
+        if not response.audio_content:
+            raise ValueError(f"TTS returned empty audio content for text: {text[:30]}...")
+        
+        print(f"[TTS] Successfully generated {len(response.audio_content)} bytes of audio")
+        return response.audio_content
     
     except Exception as e:
-        print(f"Chirp3 TTS Error (voice: {voice_name}): {str(e)}")
+        print(f"[TTS ERROR] Voice: {voice_name}, Text: '{text[:50]}...', Error: {type(e).__name__}: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise
 
 async def generate_tts_async(text, voice_name=None):
@@ -346,7 +351,9 @@ async def create_vocabulary_file_with_tts(vocabulary, topic, progress_callback=N
     Uses fixed Leda voice for all Anki vocabulary cards
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_topic_name = safe_filename(topic)
+    # Truncate topic properly before sanitizing
+    topic_truncated = topic[:50] if len(topic) > 50 else topic
+    safe_topic_name = safe_filename(topic_truncated)
     filename = f"{safe_topic_name}_{timestamp}_vocabulary.txt"
     
     content = ""
@@ -395,7 +402,9 @@ async def create_vocabulary_file_with_tts(vocabulary, topic, progress_callback=N
 
 def create_html_document(topic, content, timestamp):
     """Create a beautiful HTML document with all learning materials"""
-    safe_topic = safe_filename(topic)
+    # Truncate topic properly before sanitizing
+    topic_truncated = topic[:50] if len(topic) > 50 else topic
+    safe_topic = safe_filename(topic_truncated)
     html_filename = f"{safe_topic}_{timestamp}_materials.html"
     
     # Build vocabulary table HTML
@@ -847,7 +856,9 @@ async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_topic = safe_filename(topic)
+        # Truncate topic properly before sanitizing
+        topic_truncated = topic[:50] if len(topic) > 50 else topic
+        safe_topic = safe_filename(topic_truncated)
         
         # Step 2: Create and send HTML document
         await update_progress(2, "📄 Creating HTML document...")
@@ -947,7 +958,7 @@ async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
             opinion_text = content['opinion_texts'][key]
             
             # Send text
-            #await update.message.reply_text(f"{emoji} **{name}:**\n\n{opinion_text}", parse_mode='Markdown')
+            await update.message.reply_text(f"{emoji} **{name}:**\n\n{opinion_text}", parse_mode='Markdown')
             
             # Send audio if generation succeeded
             if not isinstance(audio_data, Exception) and audio_data:
