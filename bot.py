@@ -423,18 +423,6 @@ def create_zip_package(vocab_filename, vocab_content, audio_files, topic, timest
     
     return zip_filename, zip_buffer
 
-def format_vocabulary_preview(vocabulary):
-    """Format vocabulary for preview message"""
-    message = "📚 **Vocabulary Preview:**\n\n"
-    preview_count = min(5, len(vocabulary))
-    
-    for i, item in enumerate(vocabulary[:preview_count], 1):
-        message += f"{i}. **{item['chinese']}** ({item['pinyin']}) - {item['english']}\n"
-    
-    if len(vocabulary) > preview_count:
-        message += f"\n... and {len(vocabulary) - preview_count} more items in the ZIP file"
-    
-    return message
 
 def create_html_document(topic, content, timestamp):
     """Create a beautiful HTML document with all learning materials"""
@@ -902,12 +890,10 @@ async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_document(
             document=html_file,
             filename=html_filename,
-            caption="📄 **Learning Materials Document**\n\nOpen this HTML file in your browser for a beautifully formatted view of all materials!"
+            caption="HTML"
         )
         
-        # Send vocabulary preview in chat
-        vocab_preview = format_vocabulary_preview(content['vocabulary'])
-        await update.message.reply_text(vocab_preview, parse_mode='Markdown')
+       
         
         # Step 3: Create vocabulary file with TTS
         await update_progress(3, "🎵 Generating TTS audio for vocabulary...")
@@ -963,12 +949,8 @@ async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_document(
                 document=zip_buffer, 
                 filename=zip_filename,
-                caption=f"📦 **Complete Learning Package**\n\n"
-                       f"Contains:\n"
-                       f"• {html_filename} (Beautiful HTML document)\n"
-                       f"• {vocab_filename} (Anki vocabulary file)\n"
-                       f"• {len(audio_files)} MP3 audio files\n\n"
-                       f"Open the HTML file in your browser to view all materials!"
+                caption=f"📦 ZIP "
+                       
             )
         except ValueError as e:
             await update.message.reply_text(f"⚠️ {str(e)}")
