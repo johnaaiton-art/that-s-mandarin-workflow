@@ -4,6 +4,7 @@ import hashlib
 import re
 import zipfile
 import time
+import random
 from datetime import datetime
 from collections import defaultdict
 from telegram import Update
@@ -29,6 +30,19 @@ class Config:
     RATE_LIMIT_REQUESTS = 5
     RATE_LIMIT_WINDOW = 3600  # 1 hour in seconds
     MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB for Telegram
+    
+    # Chirp3 voices for main text and opinion texts (random selection)
+    CHIRP3_VOICES = [
+        "cmn-CN-Chirp3-HD-Aoede",
+        "cmn-CN-Chirp3-HD-Erinome",
+        "cmn-CN-Chirp3-HD-Laomedeia",
+        "cmn-CN-Chirp3-HD-Leda",
+        "cmn-CN-Chirp3-HD-Puck",
+        "cmn-CN-Chirp3-HD-Schedar"
+    ]
+    
+    # Fixed voice for Anki vocabulary cards
+    ANKI_VOICE = "cmn-CN-Chirp3-HD-Leda"
 
 config = Config()
 
@@ -146,11 +160,22 @@ def split_text_into_sentences(text, max_length=150):
     wait=wait_exponential(multiplier=1, min=2, max=5),
     retry=retry_if_exception_type(Exception)
 )
-def generate_tts_chirp_sync(text):
-    """Generate Chinese TTS audio using Google Cloud Chirp3 (sync version)"""
+def generate_tts_chirp3_sync(text, voice_name=None):
+    """
+    Generate Chinese TTS audio using Google Cloud Chirp3 (sync version)
+    
+    Args:
+        text: Chinese text to convert to speech
+        voice_name: Specific Chirp3 voice to use. If None, randomly selects from config.CHIRP3_VOICES
+    """
     try:
         client = get_google_tts_client()
         
+        # Select voice: use provided voice_name or randomly select one
+        if voice_name is None:
+            voice_name = random.choice(config.CHIRP3_VOICES)
+        
+        # Split text into manageable sentences for better quality
         sentences = split_text_into_sentences(text, max_length=150)
         
         all_audio = b""
@@ -158,7 +183,7 @@ def generate_tts_chirp_sync(text):
             synthesis_input = texttospeech.SynthesisInput(text=sentence)
             voice = texttospeech.VoiceSelectionParams(
                 language_code="cmn-CN",
-                name="cmn-CN-Chirp3-HD-Aoede",
+                name=voice_name,
                 ssml_gender=texttospeech.SsmlVoiceGender.FEMALE
             )
             
@@ -177,51 +202,19 @@ def generate_tts_chirp_sync(text):
         return all_audio
     
     except Exception as e:
-        print(f"Chirp3 TTS Error: {str(e)}")
-        # Try fallback to Wavenet
-        return generate_tts_wavenet_sync(text)
+        print(f"Chirp3 TTS Error (voice: {voice_name}): {str(e)}")
+        raise
 
-@retry(
-    stop=stop_after_attempt(2),
-    wait=wait_exponential(multiplier=1, min=2, max=5),
-    retry=retry_if_exception_type(Exception)
-)
-def generate_tts_wavenet_sync(text):
-    """Fallback TTS using Wavenet (sync version)"""
-    try:
-        client = get_google_tts_client()
-        
-        synthesis_input = texttospeech.SynthesisInput(text=text)
-        voice = texttospeech.VoiceSelectionParams(
-            language_code="cmn-CN",
-            name="cmn-CN-Wavenet-A",
-            ssml_gender=texttospeech.SsmlVoiceGender.FEMALE
-        )
-        
-        audio_config = texttospeech.AudioConfig(
-            audio_encoding=texttospeech.AudioEncoding.MP3,
-            speaking_rate=0.8,
-        )
-        
-        response = client.synthesize_speech(
-            input=synthesis_input,
-            voice=voice,
-            audio_config=audio_config
-        )
-        
-        return response.audio_content
+async def generate_tts_async(text, voice_name=None):
+    """
+    Run TTS generation in thread pool
     
-    except Exception as e:
-        print(f"Wavenet TTS Error: {str(e)}")
-        return None
-
-async def generate_tts_async(text, use_chirp=True):
-    """Run TTS generation in thread pool"""
+    Args:
+        text: Chinese text to convert to speech
+        voice_name: Specific Chirp3 voice to use. If None, randomly selects
+    """
     loop = asyncio.get_event_loop()
-    if use_chirp:
-        return await loop.run_in_executor(None, generate_tts_chirp_sync, text)
-    else:
-        return await loop.run_in_executor(None, generate_tts_wavenet_sync, text)
+    return await loop.run_in_executor(None, generate_tts_chirp3_sync, text, voice_name)
 
 def safe_filename(filename):
     """Sanitize filename to prevent path traversal (ZIP slip vulnerability)"""
@@ -348,7 +341,10 @@ Important requirements:
         raise
 
 async def create_vocabulary_file_with_tts(vocabulary, topic, progress_callback=None):
-    """Create tab-delimited vocabulary file with TTS audio tags and return audio files"""
+    """
+    Create tab-delimited vocabulary file with TTS audio tags and return audio files
+    Uses fixed Leda voice for all Anki vocabulary cards
+    """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_topic_name = safe_filename(topic)
     filename = f"{safe_topic_name}_{timestamp}_vocabulary.txt"
@@ -358,10 +354,11 @@ async def create_vocabulary_file_with_tts(vocabulary, topic, progress_callback=N
     
     total_items = len(vocabulary)
     
-    # Generate TTS for all vocabulary items concurrently
+    # Generate TTS for all vocabulary items concurrently using Leda voice
     tts_tasks = []
     for item in vocabulary:
-        tts_tasks.append(generate_tts_async(item['chinese'], use_chirp=False))
+        # Use the fixed Anki voice (Leda) for vocabulary cards
+        tts_tasks.append(generate_tts_async(item['chinese'], voice_name=config.ANKI_VOICE))
     
     # Await all TTS generations
     audio_results = await asyncio.gather(*tts_tasks, return_exceptions=True)
@@ -395,34 +392,6 @@ async def create_vocabulary_file_with_tts(vocabulary, topic, progress_callback=N
             content += f"{item['english']}\t{item['chinese']}\t{item['pinyin']}\t{anki_tag}\n"
     
     return filename, content, audio_files
-
-def create_zip_package(vocab_filename, vocab_content, audio_files, topic, timestamp):
-    """Create a ZIP file containing vocabulary txt and all MP3 files"""
-    safe_topic_name = safe_filename(topic)
-    zip_filename = f"{safe_topic_name}_{timestamp}_anki_package.zip"
-    zip_buffer = BytesIO()
-    
-    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-        # Sanitize vocabulary filename
-        safe_vocab_filename = safe_filename(vocab_filename)
-        
-        # Add vocabulary text file
-        zip_file.writestr(safe_vocab_filename, vocab_content.encode('utf-8'))
-        
-        # Add all audio files with sanitized names
-        for audio_filename, audio_data in audio_files.items():
-            safe_audio_filename = safe_filename(audio_filename)
-            zip_file.writestr(safe_audio_filename, audio_data)
-    
-    zip_buffer.seek(0)
-    
-    # Check file size
-    file_size = zip_buffer.getbuffer().nbytes
-    if file_size > config.MAX_FILE_SIZE:
-        raise ValueError(f"ZIP file too large: {file_size / 1024 / 1024:.1f}MB (max: {config.MAX_FILE_SIZE / 1024 / 1024}MB)")
-    
-    return zip_filename, zip_buffer
-
 
 def create_html_document(topic, content, timestamp):
     """Create a beautiful HTML document with all learning materials"""
@@ -770,7 +739,7 @@ def create_html_document(topic, content, timestamp):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send a message when the command /start is issued."""
     await update.message.reply_text(
-        "欢迎! Enter your topic,detailed without being too long! 🎓\n\n"
+        "欢迎! Enter your topic, detailed without being too long! 🎓\n\n"
         
     )
 
@@ -890,13 +859,11 @@ async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_document(
             document=html_file,
             filename=html_filename,
-            caption="HTML"
+            caption="📄 HTML Learning Materials"
         )
         
-       
-        
-        # Step 3: Create vocabulary file with TTS
-        await update_progress(3, "🎵 Generating TTS audio for vocabulary...")
+        # Step 3: Create vocabulary file with TTS (using Leda voice)
+        await update_progress(3, "🎵 Generating TTS audio for vocabulary (Leda voice)...")
         await update.message.chat.send_action(action="record_voice")
         
         async def vocab_progress(current, total):
@@ -916,9 +883,6 @@ async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update_progress(4, "📦 Creating complete package...")
         
         try:
-            # Get HTML content for ZIP
-            html_filename, html_content = create_html_document(topic, content, timestamp)
-            
             # Create enhanced ZIP with HTML
             zip_filename = f"{safe_topic}_{timestamp}_complete_package.zip"
             zip_buffer = BytesIO()
@@ -949,8 +913,7 @@ async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_document(
                 document=zip_buffer, 
                 filename=zip_filename,
-                caption=f"📦 ZIP "
-                       
+                caption=f"📦 Complete Package (Anki-ready)"
             )
         except ValueError as e:
             await update.message.reply_text(f"⚠️ {str(e)}")
@@ -963,8 +926,8 @@ async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
             vocab_file.name = vocab_filename
             await update.message.reply_document(document=vocab_file, filename=vocab_filename)
         
-        # Step 5: Generate and send opinion texts with audio
-        await update_progress(5, "🎤 Generating opinion texts with audio...")
+        # Step 5: Generate and send opinion texts with audio (using random Chirp3 voices)
+        await update_progress(5, "🎤 Generating opinion texts with audio (random Chirp3 voices)...")
         
         perspectives = [
             ("positive", "Positive View", "😊"),
@@ -972,10 +935,11 @@ async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ("balanced", "Balanced View", "⚖️")
         ]
         
-        # Generate all opinion audio concurrently
+        # Generate all opinion audio concurrently with randomly selected voices
         opinion_tasks = []
         for key, name, emoji in perspectives:
-            opinion_tasks.append(generate_tts_async(content['opinion_texts'][key], use_chirp=True))
+            # Each opinion text gets a randomly selected Chirp3 voice
+            opinion_tasks.append(generate_tts_async(content['opinion_texts'][key], voice_name=None))
         
         opinion_audios = await asyncio.gather(*opinion_tasks, return_exceptions=True)
         
@@ -994,7 +958,7 @@ async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await update.message.reply_text(f"⚠️ Could not generate audio for {name}.")
         
-        # Send discussion questions (keeping in chat for quick reference)
+        # Send discussion questions
         questions_text = "💬 **Discussion Questions:**\n\n"
         for i, question in enumerate(content['discussion_questions'], 1):
             questions_text += f"{i}. {question}\n"
@@ -1004,11 +968,12 @@ async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Final success message
         await progress_msg.edit_text(
             f"✅ **Complete!**\n\n"
-            
+            f"Generated materials with Chirp3 HD voices:\n"
+            f"• Vocabulary: Leda voice\n"
+            f"• Opinion texts: Random Chirp3 voices"
         )
         
         await update.message.reply_text(
-           
             "Need help? Send /help"
         )
         
@@ -1040,6 +1005,9 @@ def main():
     print(f"- API retry attempts: {config.API_RETRY_ATTEMPTS}")
     print(f"- Content level: HSK5 (250 character main text)")
     print(f"- Vocabulary focus: Collocations and phrases")
+    print(f"- TTS voices:")
+    print(f"  • Anki vocabulary: {config.ANKI_VOICE}")
+    print(f"  • Opinion texts: Random selection from {len(config.CHIRP3_VOICES)} Chirp3 HD voices")
     
     # Create the Application
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
