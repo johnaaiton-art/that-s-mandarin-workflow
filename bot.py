@@ -167,7 +167,7 @@ def generate_tts_chirp3_sync(text, voice_name=None, speaking_rate=1.0):
     Args:
         text: Chinese text to convert to speech
         voice_name: Specific Chirp3 voice to use. If None, randomly selects from config.CHIRP3_VOICES
-        speaking_rate: Speed of speech (0.25 to 2.0). Default 1.0. Lower = slower.
+        speaking_rate: Speed of speech (0.25 to 2.0). Default 0.8. Lower = slower.
     """
     try:
         client = get_google_tts_client()
