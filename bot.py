@@ -278,59 +278,32 @@ Important requirements:
         raise
 
 async def create_vocabulary_file_with_tts(vocabulary, topic, progress_callback=None):
-    """
-    Create tab-delimited vocabulary file with TTS audio tags and return audio files
-    Uses fixed Leda voice for all Anki vocabulary cards
-    """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    # Truncate topic properly before sanitizing
     topic_truncated = topic[:50] if len(topic) > 50 else topic
     safe_topic_name = safe_filename(topic_truncated)
     filename = f"{safe_topic_name}_{timestamp}_vocabulary.txt"
-    
     content = ""
     audio_files = {}
-    
     total_items = len(vocabulary)
-    
-    # Generate TTS for all vocabulary items concurrently using Leda voice at 80% speed
     tts_tasks = []
     for item in vocabulary:
-        # Use the fixed Anki voice (Leda) at 0.8 speed for vocabulary cards
         tts_tasks.append(generate_tts_async(item['chinese'], voice_name=config.ANKI_VOICE, speaking_rate=0.8))
-    
-    # Await all TTS generations
     audio_results = await asyncio.gather(*tts_tasks, return_exceptions=True)
-    
     for idx, (item, audio_data) in enumerate(zip(vocabulary, audio_results)):
         chinese_text = item['chinese']
-        
         if progress_callback:
             await progress_callback(idx + 1, total_items)
-        
-        # Check if audio generation succeeded
-        if isinstance(audio_data, Exception) or not audio_
+        if isinstance(audio_data, Exception) or not audio_data:  # FIXED: Complete variable name
             error_msg = str(audio_data) if isinstance(audio_data, Exception) else "No audio data"
             print(f"[VOCAB TTS] ❌ Failed for '{chinese_text}': {error_msg}")
-            # Add row without audio
             content += f"{item['english']}\t{item['chinese']}\t{item['pinyin']}\n"
         else:
-            # Create filename using MD5 hash
             hash_object = hashlib.md5(chinese_text.encode())
             audio_filename = f"tts_{hash_object.hexdigest()}.mp3"
-            
-            # Sanitize filename
             audio_filename = safe_filename(audio_filename)
-            
-            # Store audio data
             audio_files[audio_filename] = audio_data
-            
-            # Create Anki sound tag
             anki_tag = f"[sound:{audio_filename}]"
-            
-            # Add row with 4 columns: english, chinese, pinyin, audio_tag
             content += f"{item['english']}\t{item['chinese']}\t{item['pinyin']}\t{anki_tag}\n"
-    
     return filename, content, audio_files
 
 def create_html_document(topic, content, timestamp):
@@ -501,3 +474,97 @@ def create_html_document(topic, content, timestamp):
 </body>
 </html>"""
     return html_filename, html_content
+
+# Bot Handlers
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🇨🇳 欢迎！发送任何话题，我会为你生成中文学习材料，包括：\n\n"
+        "• 中文课文 (HSK5水平)\n"
+        "• 词汇表 (带拼音和音频)\n"
+        "• 不同观点的短文\n"
+        "• 讨论问题\n\n"
+        "请输入一个话题："
+    )
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    if not rate_limiter.is_allowed(user_id):
+        reset_time = rate_limiter.get_reset_time(user_id)
+        await update.message.reply_text(
+            f"⏰ 请求过于频繁。请等待 {reset_time} 秒后再试。"
+        )
+        return
+
+    try:
+        topic = validate_topic(update.message.text)
+        await update.message.reply_text(f"🔄 正在为『{topic}』生成学习材料...")
+        
+        # Generate content
+        content = await asyncio.get_event_loop().run_in_executor(
+            None, generate_content_with_deepseek, topic
+        )
+        
+        # Create files
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Create vocabulary file with TTS
+        vocab_filename, vocab_content, audio_files = await create_vocabulary_file_with_tts(
+            content['vocabulary'], topic
+        )
+        
+        # Create HTML document
+        html_filename, html_content = create_html_document(topic, content, timestamp)
+        
+        # Create zip file
+        zip_buffer = BytesIO()
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            # Add vocabulary file
+            zip_file.writestr(vocab_filename, vocab_content)
+            
+            # Add audio files
+            for audio_filename, audio_data in audio_files.items():
+                zip_file.writestr(audio_filename, audio_data)
+            
+            # Add HTML file
+            zip_file.writestr(html_filename, html_content)
+            
+            # Add main text as separate file
+            main_text_filename = f"{safe_filename(topic)}_{timestamp}_main_text.txt"
+            zip_file.writestr(main_text_filename, content['main_text'])
+        
+        zip_buffer.seek(0)
+        
+        # Send zip file
+        await update.message.reply_document(
+            document=zip_buffer,
+            filename=f"{safe_filename(topic)}_{timestamp}_materials.zip",
+            caption=f"📚 学习材料: {topic}\n\n包含：课文、词汇表、音频、HTML文档"
+        )
+        
+    except ValueError as e:
+        await update.message.reply_text(f"❌ 错误: {str(e)}")
+    except Exception as e:
+        print(f"[ERROR] {type(e).__name__}: {str(e)}")
+        await update.message.reply_text("❌ 生成材料时出现错误，请稍后重试。")
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print(f"[ERROR] {context.error}")
+    if update and update.effective_message:
+        await update.effective_message.reply_text("❌ 发生意外错误，请稍后重试。")
+
+def main():
+    if not TELEGRAM_BOT_TOKEN:
+        raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required")
+    
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_error_handler(error_handler)
+    
+    print("🤖 Bot is running...")
+    application.run_polling()
+
+if __name__ == "__main__":
+    main()
