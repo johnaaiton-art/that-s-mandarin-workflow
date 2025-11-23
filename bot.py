@@ -278,32 +278,59 @@ Important requirements:
         raise
 
 async def create_vocabulary_file_with_tts(vocabulary, topic, progress_callback=None):
+    """
+    Create tab-delimited vocabulary file with TTS audio tags and return audio files
+    Uses fixed Leda voice for all Anki vocabulary cards
+    """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Truncate topic properly before sanitizing
     topic_truncated = topic[:50] if len(topic) > 50 else topic
     safe_topic_name = safe_filename(topic_truncated)
     filename = f"{safe_topic_name}_{timestamp}_vocabulary.txt"
+    
     content = ""
     audio_files = {}
+    
     total_items = len(vocabulary)
+    
+    # Generate TTS for all vocabulary items concurrently using Leda voice at 80% speed
     tts_tasks = []
     for item in vocabulary:
+        # Use the fixed Anki voice (Leda) at 0.8 speed for vocabulary cards
         tts_tasks.append(generate_tts_async(item['chinese'], voice_name=config.ANKI_VOICE, speaking_rate=0.8))
+    
+    # Await all TTS generations
     audio_results = await asyncio.gather(*tts_tasks, return_exceptions=True)
+    
     for idx, (item, audio_data) in enumerate(zip(vocabulary, audio_results)):
         chinese_text = item['chinese']
+        
         if progress_callback:
             await progress_callback(idx + 1, total_items)
+        
+        # Check if audio generation succeeded
         if isinstance(audio_data, Exception) or not audio_
             error_msg = str(audio_data) if isinstance(audio_data, Exception) else "No audio data"
             print(f"[VOCAB TTS] ❌ Failed for '{chinese_text}': {error_msg}")
+            # Add row without audio
             content += f"{item['english']}\t{item['chinese']}\t{item['pinyin']}\n"
         else:
+            # Create filename using MD5 hash
             hash_object = hashlib.md5(chinese_text.encode())
             audio_filename = f"tts_{hash_object.hexdigest()}.mp3"
+            
+            # Sanitize filename
             audio_filename = safe_filename(audio_filename)
+            
+            # Store audio data
             audio_files[audio_filename] = audio_data
+            
+            # Create Anki sound tag
             anki_tag = f"[sound:{audio_filename}]"
+            
+            # Add row with 4 columns: english, chinese, pinyin, audio_tag
             content += f"{item['english']}\t{item['chinese']}\t{item['pinyin']}\t{anki_tag}\n"
+    
     return filename, content, audio_files
 
 def create_html_document(topic, content, timestamp):
