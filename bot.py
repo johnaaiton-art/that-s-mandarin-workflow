@@ -33,18 +33,15 @@ class Config:
     
     # Primary Chirp3 voices (reduced to most reliable)
     CHIRP3_VOICES = [
-        "cmn-CN-Chirp3-HD-Fenrir",    
+        "cmn-CN-Chirp3-HD-Aoede",
         "cmn-CN-Chirp3-HD-Leda",
-        "cmn-CN-Chirp3-HD-Puck",
-        "cmn-CN-Chirp3-HD-Sadachbia",
-        "cmn-CN-Chirp3-HD-Sulafat"
+        "cmn-CN-Chirp3-HD-Puck"
     ]
     
     # Backup voices
     CHIRP3_BACKUP_VOICES = [
         "cmn-CN-Chirp3-HD-Leda",
-        "cmn-CN-Chirp3-HD-Iapetus"
-        
+        "cmn-CN-Chirp3-HD-Aoede"
     ]
     
     ANKI_VOICE = "cmn-CN-Chirp3-HD-Leda"
