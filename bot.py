@@ -33,15 +33,18 @@ class Config:
     
     # Primary Chirp3 voices (reduced to most reliable)
     CHIRP3_VOICES = [
-        "cmn-CN-Chirp3-HD-Aoede",
+        "cmn-CN-Chirp3-HD-Fenrir",    
         "cmn-CN-Chirp3-HD-Leda",
-        "cmn-CN-Chirp3-HD-Puck"
+        "cmn-CN-Chirp3-HD-Puck",
+        "cmn-CN-Chirp3-HD-Sadachbia",
+        "cmn-CN-Chirp3-HD-Sulafat"
     ]
     
     # Backup voices
     CHIRP3_BACKUP_VOICES = [
         "cmn-CN-Chirp3-HD-Leda",
-        "cmn-CN-Chirp3-HD-Aoede"
+        "cmn-CN-Chirp3-HD-Iapetus"
+        
     ]
     
     ANKI_VOICE = "cmn-CN-Chirp3-HD-Leda"
@@ -364,6 +367,70 @@ Just send a topic to begin!"""
     
     await update.message.reply_text(welcome_msg)
 
+def create_html_document(topic, content, timestamp):
+    """Create HTML document"""
+    topic_truncated = topic[:50] if len(topic) > 50 else topic
+    safe_topic = safe_filename(topic_truncated)
+    html_filename = f"{safe_topic}_{timestamp}_materials.html"
+    
+    vocab_rows = ""
+    for i, item in enumerate(content['vocabulary'], 1):
+        vocab_rows += f"<tr><td>{i}</td><td class='chinese'>{item['chinese']}</td><td class='pinyin'>{item['pinyin']}</td><td>{item['english']}</td></tr>\n"
+    
+    questions_html = ""
+    for i, question in enumerate(content['discussion_questions'], 1):
+        questions_html += f"<div class='question'><span class='question-number'>{i}</span><span class='question-text'>{question}</span></div>\n"
+    
+    html_content = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chinese Learning: {topic}</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif;line-height:1.8;color:#333;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);padding:20px;min-height:100vh}}
+.container{{max-width:900px;margin:0 auto;background:white;border-radius:20px;box-shadow:0 20px 60px rgba(0,0,0,0.3);overflow:hidden}}
+.header{{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white;padding:40px;text-align:center}}
+.header h1{{font-size:2em;margin-bottom:10px;text-shadow:2px 2px 4px rgba(0,0,0,0.2)}}
+.content{{padding:40px}}
+.section{{margin-bottom:50px}}
+.section-title{{font-size:1.8em;color:#667eea;margin-bottom:20px;padding-bottom:10px;border-bottom:3px solid #667eea}}
+.main-text{{background:linear-gradient(135deg,#f5f7fa 0%,#c3cfe2 100%);padding:30px;border-radius:15px;font-size:1.3em;line-height:2;color:#2c3e50;box-shadow:0 5px 15px rgba(0,0,0,0.1)}}
+.chinese{{font-size:1.2em;font-weight:600;color:#2c3e50}}
+.pinyin{{color:#7f8c8d;font-style:italic}}
+table{{width:100%;border-collapse:collapse;margin-top:20px;box-shadow:0 5px 15px rgba(0,0,0,0.1);border-radius:10px;overflow:hidden}}
+th{{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white;padding:15px;text-align:left;font-weight:600}}
+td{{padding:15px;border-bottom:1px solid #ecf0f1}}
+tr:hover{{background-color:#f8f9fa}}
+tr:last-child td{{border-bottom:none}}
+.opinion-box{{background:white;border-radius:15px;padding:25px;margin-bottom:25px;box-shadow:0 5px 15px rgba(0,0,0,0.1);border-left:5px solid}}
+.opinion-box.positive{{border-left-color:#27ae60}}
+.opinion-box.negative{{border-left-color:#e74c3c}}
+.opinion-box.balanced{{border-left-color:#3498db}}
+.opinion-title{{font-size:1.2em;font-weight:600;margin-bottom:15px}}
+.opinion-text{{font-size:1.1em;line-height:2;color:#2c3e50}}
+.question{{background:white;padding:20px;border-radius:10px;margin-bottom:15px;box-shadow:0 3px 10px rgba(0,0,0,0.1);display:flex;gap:15px}}
+.question-number{{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white;width:35px;height:35px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:600;flex-shrink:0}}
+.question-text{{flex:1;font-size:1.1em;line-height:1.6;color:#2c3e50}}
+</style>
+</head>
+<body>
+<div class="container">
+<div class="header"><h1>{topic}</h1></div>
+<div class="content">
+<div class="section"><h2 class="section-title">📖 Main Text</h2><div class="main-text">{content['main_text']}</div></div>
+<div class="section"><h2 class="section-title">📝 Vocabulary</h2><table><thead><tr><th>#</th><th>Chinese</th><th>Pinyin</th><th>English</th></tr></thead><tbody>{vocab_rows}</tbody></table></div>
+<div class="section"><h2 class="section-title">💭 Perspectives</h2>
+<div class="opinion-box positive"><div class="opinion-title">✅ Positive View</div><div class="opinion-text">{content['opinion_texts']['positive']}</div></div>
+<div class="opinion-box negative"><div class="opinion-title">⚠️ Critical View</div><div class="opinion-text">{content['opinion_texts']['negative']}</div></div>
+<div class="opinion-box balanced"><div class="opinion-title">⚖️ Balanced View</div><div class="opinion-text">{content['opinion_texts']['balanced']}</div></div>
+</div>
+<div class="section"><h2 class="section-title">❓ Discussion Questions</h2>{questions_html}</div>
+</div></div></body></html>"""
+    
+    return html_filename, html_content
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle topic messages"""
     user_id = update.effective_user.id
@@ -379,7 +446,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         topic = validate_topic(update.message.text)
         
         status_msg = await update.message.reply_text(
-            "🔄 Generating materials... This may take 1-2 minutes."
+            "🔄 Generating materials..."
         )
         
         # Generate content
@@ -388,82 +455,110 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text("✅ Content generated\n🎙️ Creating audio files...")
         
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_topic_name = safe_filename(topic[:50])
         
-        # Create vocabulary with TTS
-        vocab_filename, vocab_content, vocab_audio_files, vocab_voice_info = \
-            await create_vocabulary_file_with_tts(content['vocabulary'], topic)
+        # 1. Generate main text TTS (random Chirp3 voice)
+        await status_msg.edit_text("🎙️ Creating main text audio...")
+        main_audio_data, main_voice_used, main_success = await generate_tts_async(
+            content['main_text'],
+            voice_name=None,  # Random Chirp3
+            speaking_rate=0.9
+        )
         
+        # 2. Generate opinion TTS (random Chirp3 voices)
         await status_msg.edit_text("🎙️ Creating opinion audio files...")
-        
-        # Generate TTS for opinions
-        opinion_audio_files = {}
+        opinion_audio_data = {}
         opinion_voice_info = []
         
         for opinion_type in ['positive', 'negative', 'balanced']:
             opinion_text = content['opinion_texts'][opinion_type]
             audio_data, voice_used, success = await generate_tts_async(
                 opinion_text, 
-                voice_name=None,  # Random voice
+                voice_name=None,  # Random Chirp3
                 speaking_rate=0.9
             )
             
             if success and audio_data:
-                safe_topic_name = safe_filename(topic[:50])
-                audio_filename = f"{safe_topic_name}_{timestamp}_{opinion_type}.mp3"
-                opinion_audio_files[audio_filename] = audio_data
+                opinion_audio_data[opinion_type] = audio_data
                 opinion_voice_info.append(f"✅ {opinion_type}: {voice_used}")
             else:
                 opinion_voice_info.append(f"❌ {opinion_type}: FAILED")
         
-        # Generate main text TTS
-        main_audio_data, main_voice_used, main_success = await generate_tts_async(
-            content['main_text'],
-            voice_name=None,
-            speaking_rate=0.9
-        )
+        # 3. Create vocabulary with TTS (Leda voice for Anki)
+        await status_msg.edit_text("🎙️ Creating vocabulary audio...")
+        vocab_filename, vocab_content, vocab_audio_files, vocab_voice_info = \
+            await create_vocabulary_file_with_tts(content['vocabulary'], topic)
         
-        if main_success and main_audio_data:
-            safe_topic_name = safe_filename(topic[:50])
-            main_audio_filename = f"{safe_topic_name}_{timestamp}_main.mp3"
-            opinion_audio_files[main_audio_filename] = main_audio_data
-            opinion_voice_info.append(f"✅ main_text: {main_voice_used}")
+        # 4. Create HTML
+        await status_msg.edit_text("📝 Creating HTML document...")
+        html_filename, html_content = create_html_document(topic, content, timestamp)
+        
+        # Send voice info report
+        voice_report = "🎙️ **TTS Voice Report**\n\n"
+        if main_success:
+            voice_report += f"**Main Text:** ✅ {main_voice_used}\n\n"
         else:
-            opinion_voice_info.append(f"❌ main_text: FAILED")
+            voice_report += "**Main Text:** ❌ FAILED\n\n"
         
-        # Send voice info to user
-        voice_report = "🎙️ **TTS Voice Report**\n\n**Vocabulary:**\n"
-        voice_report += "\n".join(vocab_voice_info[:5])  # First 5
-        if len(vocab_voice_info) > 5:
-            voice_report += f"\n... and {len(vocab_voice_info) - 5} more\n"
-        voice_report += "\n\n**Opinion Texts:**\n"
-        voice_report += "\n".join(opinion_voice_info)
+        voice_report += "**Opinion Texts:**\n" + "\n".join(opinion_voice_info)
+        voice_report += f"\n\n**Vocabulary:** {len(vocab_audio_files)} audio files created"
         
         await update.message.reply_text(voice_report)
         
-        # Create ZIP file
-        await status_msg.edit_text("📦 Creating package...")
+        # Now send files in order:
+        await status_msg.edit_text("📤 Sending files...")
         
+        # 1. HTML file
+        html_buffer = BytesIO(html_content.encode('utf-8'))
+        html_buffer.seek(0)
+        await update.message.reply_document(
+            document=html_buffer,
+            filename=html_filename
+        )
+        
+        # 2. Main text audio
+        if main_success and main_audio_data:
+            main_audio_filename = f"{safe_topic_name}_{timestamp}_main.mp3"
+            main_audio_buffer = BytesIO(main_audio_data)
+            main_audio_buffer.seek(0)
+            await update.message.reply_audio(
+                audio=main_audio_buffer,
+                filename=main_audio_filename
+            )
+        
+        # 3. Opinion audio files (positive, negative, balanced)
+        for opinion_type in ['positive', 'negative', 'balanced']:
+            if opinion_type in opinion_audio_data:
+                audio_filename = f"{safe_topic_name}_{timestamp}_{opinion_type}.mp3"
+                audio_buffer = BytesIO(opinion_audio_data[opinion_type])
+                audio_buffer.seek(0)
+                await update.message.reply_audio(
+                    audio=audio_buffer,
+                    filename=audio_filename
+                )
+        
+        # 4. Anki vocabulary text file
+        vocab_buffer = BytesIO(vocab_content.encode('utf-8'))
+        vocab_buffer.seek(0)
+        await update.message.reply_document(
+            document=vocab_buffer,
+            filename=vocab_filename
+        )
+        
+        # 5. ZIP file with ONLY Anki TTS audio files
+        await status_msg.edit_text("📦 Creating Anki audio package...")
         zip_buffer = BytesIO()
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-            # Add vocabulary file
-            zip_file.writestr(vocab_filename, vocab_content)
-            
-            # Add all audio files
+            # Only add vocabulary audio files (for Anki)
             for filename, audio_data in vocab_audio_files.items():
-                zip_file.writestr(filename, audio_data)
-            
-            for filename, audio_data in opinion_audio_files.items():
                 zip_file.writestr(filename, audio_data)
         
         zip_buffer.seek(0)
-        
-        safe_topic_name = safe_filename(topic[:50])
-        zip_filename = f"{safe_topic_name}_{timestamp}_package.zip"
+        zip_filename = f"{safe_topic_name}_{timestamp}_anki_audio.zip"
         
         await update.message.reply_document(
             document=zip_buffer,
-            filename=zip_filename,
-            caption=f"✅ Chinese learning package for: {topic}"
+            filename=zip_filename
         )
         
         await status_msg.delete()
